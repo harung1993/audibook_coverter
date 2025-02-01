@@ -41,7 +41,7 @@ sudo pacman -S ffmpeg
 ### **1⃣ Clone the Repository**  
 
 ```bash
-git clone https://github.com/YOUR-USERNAME/audiobook_converter.git
+git clone https://github.com/harung1993/audiobook_converter.git
 cd audiobook_converter
 ```
 
@@ -125,5 +125,5 @@ This project is open-source under the **MIT License**.
 
 ## 📢 Credits  
 
-Developed by **Your Name** 🚀  
+Developed by **Harun GUNA** 🚀  
 
