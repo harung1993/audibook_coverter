@@ -1,17 +1,28 @@
 #!/bin/bash
 
-# Check if a folder path was provided, otherwise use the current directory
+# Check if a file or folder path was provided
 if [[ -n "$1" ]]; then
-    cd "$1" || { echo "Error: Folder not found!"; exit 1; }
+    if [[ -f "$1" ]]; then
+        audiobook_name="${1%.*}"
+        existing_file="$1"
+    elif [[ -d "$1" ]]; then
+        cd "$1" || { echo "Error: Folder not found!"; exit 1; }
+    else
+        echo "Error: Invalid file or folder provided!"
+        exit 1
+    fi
 fi
 
-# Get audiobook name from folder name
-audiobook_name=$(basename "$PWD")
+# Determine audiobook name based on folder if executing inside a folder
+if [[ -z "$audiobook_name" || "$audiobook_name" == "" ]]; then
+    audiobook_name=$(basename "$PWD")
+fi
 
-# Count the number of MP3 files in the folder
+# Count the number of MP3 and M4B files in the folder
 mp3_count=$(ls -1 *.mp3 2>/dev/null | wc -l)
+m4b_count=$(ls -1 *.m4b 2>/dev/null | wc -l)
 
-# Check if a cover image exists (cover.jpg, folder.jpg, or first found image)
+# Check if a cover image exists
 cover_image=""
 if [[ -f "cover.jpg" ]]; then
     cover_image="cover.jpg"
@@ -24,64 +35,70 @@ else
     fi
 fi
 
-# Function to extract metadata
-extract_metadata() {
-    local file="$1"
-    title=$(ffprobe -v error -show_entries format_tags=title -of default=noprint_wrappers=1:nokey=1 "$file")
-    artist=$(ffprobe -v error -show_entries format_tags=artist -of default=noprint_wrappers=1:nokey=1 "$file")
-    album=$(ffprobe -v error -show_entries format_tags=album -of default=noprint_wrappers=1:nokey=1 "$file")
-
-    # Use defaults if metadata is missing
-    [[ -z "$title" ]] && title="$audiobook_name"
-    [[ -z "$artist" ]] && artist="Unknown Author"
-    [[ -z "$album" ]] && album="$audiobook_name"
+# Function to fetch metadata from Google Books API
+fetch_metadata() {
+    local query=$(echo "$audiobook_name" | sed 's/ /%20/g')
+    metadata=$(curl -s "https://www.googleapis.com/books/v1/volumes?q=intitle:$query")
+    
+    title=$(echo "$metadata" | jq -r '.items[0].volumeInfo.title' 2>/dev/null)
+    artist=$(echo "$metadata" | jq -r '.items[0].volumeInfo.authors[0]' 2>/dev/null)
+    album="$audiobook_name"
+    cover_url=$(echo "$metadata" | jq -r '.items[0].volumeInfo.imageLinks.thumbnail' 2>/dev/null)
+    
+    [[ -z "$title" || "$title" == "null" ]] && title="$audiobook_name"
+    [[ -z "$artist" || "$artist" == "null" ]] && artist="Unknown Author"
+    
+    if [[ -n "$cover_url" && "$cover_url" != "null" ]]; then
+        curl -s "$cover_url" -o "cover.jpg"
+        cover_image="cover.jpg"
+    fi
 }
 
-# Checks the folder, if only one mp3 it just converts it to m4b else it combines them
+# If a single M4B exists, update metadata
+if [[ "$m4b_count" -eq 1 ]]; then
+    existing_m4b=$(ls -1 *.m4b)
+    echo "🔄 Updating metadata and embedding cover for existing M4B file: $existing_m4b"
+    fetch_metadata
+    AtomicParsley "$existing_m4b" --title "$title" --artist "$artist" --album "$album" \
+        ${cover_image:+--artwork "$cover_image"} --overWrite
+    echo "✅ Metadata update complete for: $existing_m4b"
+    exit 0
+fi
+
+# If a single MP3 exists, convert and update metadata
 if [[ "$mp3_count" -eq 1 ]]; then
-    single_file=$(ls -1 *.mp3)
-    audiobook_name="${single_file%.mp3}"  # Removing .mp3 extension for naming
-
-    echo "🎧 Detected a single MP3 file: $single_file"
-    echo "Extracting metadata..."
-    
-    extract_metadata "$single_file"
-
-    echo "Converting to M4B with metadata..."
-    
-    ffmpeg -i "$single_file" \
-        -metadata title="$title" \
-        -metadata artist="$artist" \
-        -metadata album="$album" \
-        ${cover_image:+-i "$cover_image" -map 1:0 -metadata:s:v title="Cover" -metadata:s:v comment="Cover (Front)"} \
-        -c:a aac -b:a 128k -vn -f mp4 "${audiobook_name}.m4b"
-
+    single_mp3=$(ls -1 *.mp3)
+    echo "🎧 Converting single MP3 file: $single_mp3"
+    fetch_metadata
+    ffmpeg -i "$single_mp3" -c:a aac -b:a 128k -vn -f mp4 "${audiobook_name}.m4b"
+    AtomicParsley "${audiobook_name}.m4b" --title "$title" --artist "$artist" --album "$album" \
+        ${cover_image:+--artwork "$cover_image"} --overWrite
     echo "✅ Conversion complete! Your audiobook is ready as: ${audiobook_name}.m4b"
+    exit 0
+fi
 
-else
-    echo "📚 Detected multiple MP3 files. Merging before conversion..."
+# If multiple M4B files exist, merge them and update metadata
+if [[ "$m4b_count" -gt 1 ]]; then
+    echo "📚 Merging multiple M4B files into a single audiobook..."
+    ls -1 *.m4b | sed "s/^/file '/;s/$/'/" > filelist.txt
+    ffmpeg -f concat -safe 0 -i filelist.txt -c copy "${audiobook_name}_merged.m4b"
+    fetch_metadata
+    AtomicParsley "${audiobook_name}_merged.m4b" --title "$title" --artist "$artist" --album "$album" \
+        ${cover_image:+--artwork "$cover_image"} --overWrite
+    rm filelist.txt
+    echo "✅ Merging and metadata update complete! Your audiobook is ready as: ${audiobook_name}_merged.m4b"
+    exit 0
+fi
 
-    #creating the file list ffmpeg will use
+# If multiple MP3 files exist, merge, convert, and update metadata
+if [[ "$mp3_count" -gt 1 ]]; then
+    echo "📚 Merging multiple MP3 files before conversion..."
     ls -1 *.mp3 | sed "s/^/file '/;s/$/'/" > filelist.txt
-
-    # Merging mp3s into a single file
-    ffmpeg -f concat -safe 0 -i filelist.txt -c copy "${audiobook_name}.mp3"
-
-    echo "Extracting metadata from first MP3 file..."
-    first_file=$(ls -1 *.mp3 | head -n 1)
-    extract_metadata "$first_file"
-
-    echo "Converting to M4B with metadata..."
-    
-    ffmpeg -i "${audiobook_name}.mp3" \
-        -metadata title="$title" \
-        -metadata artist="$artist" \
-        -metadata album="$album" \
-        ${cover_image:+-i "$cover_image" -map 1:0 -metadata:s:v title="Cover" -metadata:s:v comment="Cover (Front)"} \
-        -c:a aac -b:a 128k -vn -f mp4 "${audiobook_name}.m4b"
-
-    # Cleaning up
-    rm filelist.txt "${audiobook_name}.mp3"
-
-    echo "✅ Conversion complete! Your audiobook is ready as: ${audiobook_name}.m4b"
+    ffmpeg -f concat -safe 0 -i filelist.txt -c:a aac -b:a 128k -vn "${audiobook_name}.m4b"
+    fetch_metadata
+    AtomicParsley "${audiobook_name}.m4b" --title "$title" --artist "$artist" --album "$album" \
+        ${cover_image:+--artwork "$cover_image"} --overWrite
+    rm filelist.txt
+    echo "✅ Merging, conversion, and metadata update complete! Your audiobook is ready as: ${audiobook_name}.m4b"
+    exit 0
 fi
